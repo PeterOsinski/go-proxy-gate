@@ -1,9 +1,6 @@
 package main
 
 import (
-	"crypto/md5"
-	"encoding/hex"
-	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -16,6 +13,7 @@ import (
 
 const IP_LIST_FILENAME = "ip_list"
 const GATE_PORT = "8080"
+const GATE_TIMEOUT = 10 //seconds
 
 const TIMEOUT_TEST_URL = "http://api.ipify.org"
 
@@ -23,13 +21,9 @@ var logger log.Logger
 var gates []Gate
 
 type Gate struct {
-	address	*url.URL
-	timeout 	[]int
+	address *url.URL
+	timeout []int
 }
-
-func (g Gate) testTimeout() {
-	
-} 
 
 func loadIpList() {
 	content, err := ioutil.ReadFile(IP_LIST_FILENAME)
@@ -38,23 +32,32 @@ func loadIpList() {
 	}
 	gateList := strings.Split(string(content), "\n")
 	logger.Printf("Loaded IP list with %d items", len(gateList))
-	
+
 	for _, address := range gateList {
-		proxyUrl, _ := url.Parse(address)
-//		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
-http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
-//		gate := Gate{address: proxyUrl}
-		resp, err := http.Get(TIMEOUT_TEST_URL)
-		
-		if err != nil {
-			logger.Println(err, "ERROR",address)
-		}else{
-			robots, _ := ioutil.ReadAll(resp.Body)
-			logger.Printf("%s\n", string(robots))
-			
-		}
-		
-	} 
+		proxyUrl, _ := url.Parse("http://" + address)
+		gates = append(gates, Gate{address: proxyUrl})
+	}
+}
+
+type RequestWithTime struct {
+	response *http.Response
+	time     int
+	err      error
+	gate     *Gate
+}
+
+func makeGetRequest(g Gate, url string, responses chan RequestWithTime) {
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(g.address)},
+		Timeout:   time.Duration(GATE_TIMEOUT * time.Second),
+	}
+
+	start := time.Now()
+	resp, err := client.Get(url)
+	dur := int(time.Since(start) / 1000000)
+
+	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
+	responses <- RequestWithTime{resp, dur, err, &g}
 }
 
 func initLogger() {
@@ -71,34 +74,56 @@ func createServer() {
 
 func handle(w http.ResponseWriter, r *http.Request) {
 
-	addr := getRandomIp()
+	gate := getRandomGate()
 
-	h := md5.New()
-	io.WriteString(h, r.URL.String())
-	io.WriteString(h, addr)
-	reqId := hex.EncodeToString(h.Sum(nil))
+	response := make(chan RequestWithTime, 1)
+	makeGetRequest(*gate, r.URL.String(), response)
+	resp := <-response
 
-	proxyUrl, _ := url.Parse("http://" + addr)
-//	http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
-	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
+	if resp.err == nil {
+		robots, _ := ioutil.ReadAll(resp.response.Body)
+		w.Write(robots)
+	} else {
+		w.Write([]byte{0, 0, 0, 0})
+	}
+}
 
-	logger.Printf("[%s] Passing request for %s through gate %s", string(reqId), r.URL.String(), addr)
+func testGates() {
 
-	resp, _ := client.Get(r.URL.String())
+	logger.Printf("Testing gates timeouts, %d gates", len(gates))
+	responses := make(chan RequestWithTime, len(gates))
 
-	logger.Printf("[%s] Received response for %s from gate %s", reqId, r.URL.String(), addr)
+	for _, gate := range gates {
+		go makeGetRequest(gate, TIMEOUT_TEST_URL, responses)
+	}
 
-	robots, _ := ioutil.ReadAll(resp.Body)
-	w.Write(robots)
+	workingGates := []Gate{}
+	for a := 1; a <= len(gates); a++ {
+		resp := <-responses
+		if resp.err == nil && resp.response.StatusCode == 200 && resp.response.ContentLength >= 7 && resp.response.ContentLength <= 15{
+			contents, _ := ioutil.ReadAll(resp.response.Body)
+			if contents != nil {
+				logger.Printf("Took time - %dms, response: %s (%d)", resp.time, contents, resp.response.ContentLength)
+				resp.gate.timeout = append(resp.gate.timeout, resp.time)
+				workingGates = append(workingGates, *resp.gate)
+			}
+		}
+	}
+	close(responses)
+
+	gates = workingGates
+
+	logger.Printf("Testing gates timeouts, completed. Working gates: %d", len(workingGates))
 }
 
 func main() {
 	initLogger()
-	loadIpList()	
-//	createServer()
+	loadIpList()
+	testGates()
+	createServer()
 }
 
-func getRandomIp() string {
+func getRandomGate() *Gate {
 	rand.Seed(time.Now().UnixNano())
-	return gates[rand.Intn(len(gates))].address.String()
+	return &gates[rand.Intn(len(gates))]
 }
