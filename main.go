@@ -17,16 +17,44 @@ import (
 const IP_LIST_FILENAME = "ip_list"
 const GATE_PORT = "8080"
 
-var gateList []string
+const TIMEOUT_TEST_URL = "http://api.ipify.org"
+
 var logger log.Logger
+var gates []Gate
+
+type Gate struct {
+	address	*url.URL
+	timeout 	[]int
+}
+
+func (g Gate) testTimeout() {
+	
+} 
 
 func loadIpList() {
 	content, err := ioutil.ReadFile(IP_LIST_FILENAME)
 	if err != nil {
 		//Do something
 	}
-	gateList = strings.Split(string(content), "\n")
+	gateList := strings.Split(string(content), "\n")
 	logger.Printf("Loaded IP list with %d items", len(gateList))
+	
+	for _, address := range gateList {
+		proxyUrl, _ := url.Parse(address)
+//		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
+http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+//		gate := Gate{address: proxyUrl}
+		resp, err := http.Get(TIMEOUT_TEST_URL)
+		
+		if err != nil {
+			logger.Println(err, "ERROR",address)
+		}else{
+			robots, _ := ioutil.ReadAll(resp.Body)
+			logger.Printf("%s\n", string(robots))
+			
+		}
+		
+	} 
 }
 
 func initLogger() {
@@ -51,11 +79,12 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	reqId := hex.EncodeToString(h.Sum(nil))
 
 	proxyUrl, _ := url.Parse("http://" + addr)
-	http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+//	http.DefaultTransport = &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
 
 	logger.Printf("[%s] Passing request for %s through gate %s", string(reqId), r.URL.String(), addr)
 
-	resp, _ := http.Get(r.URL.String())
+	resp, _ := client.Get(r.URL.String())
 
 	logger.Printf("[%s] Received response for %s from gate %s", reqId, r.URL.String(), addr)
 
@@ -65,11 +94,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initLogger()
-	loadIpList()
-	createServer()
+	loadIpList()	
+//	createServer()
 }
 
 func getRandomIp() string {
 	rand.Seed(time.Now().UnixNano())
-	return gateList[rand.Intn(len(gateList))]
+	return gates[rand.Intn(len(gates))].address.String()
 }
