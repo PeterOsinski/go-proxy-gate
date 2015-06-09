@@ -14,37 +14,38 @@ import (
 )
 
 type CLI struct {
-	IP_LIST_FILENAME string
-	PORT				string
-	GATE_TIMEOUT     int
-	MAX_RETRIES      int
-	UA_LIST			string
+	IP_LIST_FILENAME  string
+	PORT              string
+	GATE_TEST_TIMEOUT int
+	GATE_REQ_TIMEOUT  int
+	MAX_RETRIES       int
+	UA_LIST           string
 }
 
 var CF CLI
 
 const TIMEOUT_TEST_URL = "http://api.ipify.org"
 
-var logger 			log.Logger
-var gates 			[]Gate
-var uaList			[]string
-var activeRequests 	int
+var logger log.Logger
+var gates []Gate
+var uaList []string
+var activeRequests int
 
 type Gate struct {
 	address *url.URL
 	timeout []int
 }
 
-func loadLinesFromFile(f string) []string{
+func loadLinesFromFile(f string) []string {
 	content, err := ioutil.ReadFile(f)
 	if err != nil {
 		//Do something
 	}
-	
+
 	var list []string
 	list = strings.Split(string(content), "\n")
 	logger.Printf("Loaded '%s' list with %d items", f, len(list))
-	
+
 	return list
 }
 
@@ -62,23 +63,23 @@ type RequestWithTime struct {
 	gate     *Gate
 }
 
-func makeGetRequest(g Gate, url string, responses chan RequestWithTime) {
+func makeGetRequest(g Gate, url string, timeout int, responses chan RequestWithTime) {
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(g.address)},
-		Timeout:   time.Duration(time.Duration(CF.GATE_TIMEOUT) * time.Second),
+		Timeout:   time.Duration(time.Duration(timeout) * time.Second),
 	}
-	
+
 	req, _ := http.NewRequest("GET", url, nil)
-	
+
 	if len(uaList) > 0 {
-		req.Header.Set("User-Agent", getRandomUA())	
+		req.Header.Set("User-Agent", getRandomUA())
 	}
-	
+
 	start := time.Now()
 	resp, err := client.Do(req)
 	dur := int(time.Since(start) / 1000000)
 
-	//	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
+	//		logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
 	responses <- RequestWithTime{resp, dur, err, &g}
 }
 
@@ -95,8 +96,8 @@ func createServer() {
 	})
 
 	logger.Printf("Server listening on port %s", CF.PORT)
-	err := http.ListenAndServe(":"+ CF.PORT, nil)
-	
+	err := http.ListenAndServe(":"+CF.PORT, nil)
+
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -107,16 +108,40 @@ func handle(w http.ResponseWriter, r *http.Request, retryCount int) {
 	gate := getRandomGate()
 
 	response := make(chan RequestWithTime, 1)
-	makeGetRequest(*gate, r.URL.String(), response)
+	makeGetRequest(*gate, r.URL.String(), CF.GATE_REQ_TIMEOUT, response)
 	resp := <-response
 
-	if resp.err == nil {
-		robots, _ := ioutil.ReadAll(resp.response.Body)
-		w.Write(robots)
-	} else if retryCount < CF.MAX_RETRIES {
+	if resp.err == nil && resp.response.StatusCode == 200 {
+		content, errRead := ioutil.ReadAll(resp.response.Body)
+		timeout := (resp.time - 100) > (CF.GATE_REQ_TIMEOUT * 1000)
+		
+		if errRead != nil {
+//			logger.Println("Error while reading buffer")
+		}
+		
+		if timeout {
+//			logger.Println("Timeout reading body")
+		}
+		
+		contentStr := string(content)
+		
+		a1 := strings.Contains(contentStr, "</html>")
+		a2 := strings.Contains(contentStr, "</body>")
+		
+		if a1 && a2 && errRead == nil && !timeout && len(strings.Trim(contentStr, " ")) > 0 {
+//			logger.Println("Good", len(contentStr), resp.time)
+			w.Write(content)
+			return
+		}
+	}
+
+	if retryCount < CF.MAX_RETRIES {
 		retryCount += 1
-		//		logger.Printf("Retry request (%d) for: %s", retryCount, r.URL.String())
+		logger.Printf("Retry request (%d) for: %s", retryCount, r.URL.String())
 		handle(w, r, retryCount)
+	} else {
+		logger.Println("Error")
+		w.Write([]byte{0})
 	}
 }
 
@@ -126,7 +151,7 @@ func testGates() {
 	responses := make(chan RequestWithTime, len(gates))
 
 	for _, gate := range gates {
-		go makeGetRequest(gate, TIMEOUT_TEST_URL, responses)
+		go makeGetRequest(gate, TIMEOUT_TEST_URL, CF.GATE_TEST_TIMEOUT, responses)
 	}
 
 	workingGates := []Gate{}
@@ -152,13 +177,14 @@ func testGates() {
 
 func parseCli() {
 	flag.StringVar(&CF.IP_LIST_FILENAME, "ip_list_file", "ip_list", "Filename with ip gateways")
-	flag.IntVar(&CF.GATE_TIMEOUT, "gate_timeout", 10, "Maximum time (in seconds) to wait for response from gate")
+	flag.IntVar(&CF.GATE_TEST_TIMEOUT, "gate_test_timeout", 10, "Maximum time (in seconds) to wait for response from gate when testing")
+	flag.IntVar(&CF.GATE_REQ_TIMEOUT, "gate_req_timeout", 10, "Maximum time (in seconds) to wait for response from gate")
 	flag.IntVar(&CF.MAX_RETRIES, "max_retries", 10, "Maximum number of retries for one request")
 	flag.StringVar(&CF.PORT, "port", "8080", "Listen server port")
 	flag.StringVar(&CF.UA_LIST, "ua_list", "ua", "list with user-agent strings")
 
 	flag.Parse()
-	
+
 	logger.Printf("%+v\n", &CF)
 }
 
