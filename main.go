@@ -18,30 +18,38 @@ type CLI struct {
 	PORT				string
 	GATE_TIMEOUT     int
 	MAX_RETRIES      int
+	UA_LIST			string
 }
 
 var CF CLI
 
 const TIMEOUT_TEST_URL = "http://api.ipify.org"
 
-var logger log.Logger
-var gates []Gate
-var activeRequests int
+var logger 			log.Logger
+var gates 			[]Gate
+var uaList			[]string
+var activeRequests 	int
 
 type Gate struct {
 	address *url.URL
 	timeout []int
 }
 
-func loadIpList() {
-	content, err := ioutil.ReadFile(CF.IP_LIST_FILENAME)
+func loadLinesFromFile(f string) []string{
+	content, err := ioutil.ReadFile(f)
 	if err != nil {
 		//Do something
 	}
-	gateList := strings.Split(string(content), "\n")
-	logger.Printf("Loaded IP list with %d items", len(gateList))
+	
+	var list []string
+	list = strings.Split(string(content), "\n")
+	logger.Printf("Loaded '%s' list with %d items", f, len(list))
+	
+	return list
+}
 
-	for _, address := range gateList {
+func loadIpList() {
+	for _, address := range loadLinesFromFile(CF.IP_LIST_FILENAME) {
 		proxyUrl, _ := url.Parse("http://" + address)
 		gates = append(gates, Gate{address: proxyUrl})
 	}
@@ -59,9 +67,15 @@ func makeGetRequest(g Gate, url string, responses chan RequestWithTime) {
 		Transport: &http.Transport{Proxy: http.ProxyURL(g.address)},
 		Timeout:   time.Duration(time.Duration(CF.GATE_TIMEOUT) * time.Second),
 	}
-
+	
+	req, _ := http.NewRequest("GET", url, nil)
+	
+	if len(uaList) > 0 {
+		req.Header.Set("User-Agent", getRandomUA())	
+	}
+	
 	start := time.Now()
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	dur := int(time.Since(start) / 1000000)
 
 	//	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
@@ -141,6 +155,7 @@ func parseCli() {
 	flag.IntVar(&CF.GATE_TIMEOUT, "gate_timeout", 10, "Maximum time (in seconds) to wait for response from gate")
 	flag.IntVar(&CF.MAX_RETRIES, "max_retries", 10, "Maximum number of retries for one request")
 	flag.StringVar(&CF.PORT, "port", "8080", "Listen server port")
+	flag.StringVar(&CF.UA_LIST, "ua_list", "ua", "list with user-agent strings")
 
 	flag.Parse()
 	
@@ -152,6 +167,7 @@ func main() {
 	parseCli()
 	loadIpList()
 	testGates()
+	uaList = loadLinesFromFile(CF.UA_LIST)
 	showStatus()
 	createServer()
 }
@@ -163,6 +179,11 @@ func showStatus() {
 			logger.Printf("Active requests: %d, active gates: %d", activeRequests, len(gates))
 		}
 	}()
+}
+
+func getRandomUA() string {
+	rand.Seed(time.Now().UnixNano())
+	return uaList[rand.Intn(len(uaList))]
 }
 
 func getRandomGate() *Gate {
