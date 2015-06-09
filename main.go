@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -11,14 +13,20 @@ import (
 	"time"
 )
 
-const IP_LIST_FILENAME = "ip_list"
-const GATE_PORT = "8080"
-const GATE_TIMEOUT = 10 //seconds
+type CLI struct {
+	IP_LIST_FILENAME string
+	PORT				string
+	GATE_TIMEOUT     int
+	MAX_RETRIES      int
+}
+
+var CF CLI
 
 const TIMEOUT_TEST_URL = "http://api.ipify.org"
 
 var logger log.Logger
 var gates []Gate
+var activeRequests int
 
 type Gate struct {
 	address *url.URL
@@ -26,7 +34,7 @@ type Gate struct {
 }
 
 func loadIpList() {
-	content, err := ioutil.ReadFile(IP_LIST_FILENAME)
+	content, err := ioutil.ReadFile(CF.IP_LIST_FILENAME)
 	if err != nil {
 		//Do something
 	}
@@ -49,14 +57,14 @@ type RequestWithTime struct {
 func makeGetRequest(g Gate, url string, responses chan RequestWithTime) {
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(g.address)},
-		Timeout:   time.Duration(GATE_TIMEOUT * time.Second),
+		Timeout:   time.Duration(time.Duration(CF.GATE_TIMEOUT) * time.Second),
 	}
 
 	start := time.Now()
 	resp, err := client.Get(url)
 	dur := int(time.Since(start) / 1000000)
 
-	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
+	//	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
 	responses <- RequestWithTime{resp, dur, err, &g}
 }
 
@@ -66,13 +74,21 @@ func initLogger() {
 }
 
 func createServer() {
-	http.HandleFunc("/", handle)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		activeRequests++
+		handle(w, r, 1)
+		activeRequests--
+	})
 
-	logger.Printf("Server listening on port %s", GATE_PORT)
-	http.ListenAndServe(":"+GATE_PORT, nil)
+	logger.Printf("Server listening on port %s", CF.PORT)
+	err := http.ListenAndServe(":"+ CF.PORT, nil)
+	
+	if err != nil {
+		logger.Fatal(err)
+	}
 }
 
-func handle(w http.ResponseWriter, r *http.Request) {
+func handle(w http.ResponseWriter, r *http.Request, retryCount int) {
 
 	gate := getRandomGate()
 
@@ -83,8 +99,10 @@ func handle(w http.ResponseWriter, r *http.Request) {
 	if resp.err == nil {
 		robots, _ := ioutil.ReadAll(resp.response.Body)
 		w.Write(robots)
-	} else {
-		w.Write([]byte{0, 0, 0, 0})
+	} else if retryCount < CF.MAX_RETRIES {
+		retryCount += 1
+		//		logger.Printf("Retry request (%d) for: %s", retryCount, r.URL.String())
+		handle(w, r, retryCount)
 	}
 }
 
@@ -100,27 +118,51 @@ func testGates() {
 	workingGates := []Gate{}
 	for a := 1; a <= len(gates); a++ {
 		resp := <-responses
-		if resp.err == nil && resp.response.StatusCode == 200 && resp.response.ContentLength >= 7 && resp.response.ContentLength <= 15{
+		if resp.err == nil && resp.response.StatusCode == 200 && resp.response.ContentLength >= 7 && resp.response.ContentLength <= 15 {
 			contents, _ := ioutil.ReadAll(resp.response.Body)
 			if contents != nil {
-				logger.Printf("Took time - %dms, response: %s (%d)", resp.time, contents, resp.response.ContentLength)
+				//				logger.Printf("Took time - %dms, response: %s (%d)", resp.time, contents, resp.response.ContentLength)
 				resp.gate.timeout = append(resp.gate.timeout, resp.time)
 				workingGates = append(workingGates, *resp.gate)
+				fmt.Printf(".")
 			}
 		}
 	}
+	fmt.Printf("\n")
 	close(responses)
 
 	gates = workingGates
 
-	logger.Printf("Testing gates timeouts, completed. Working gates: %d", len(workingGates))
+	logger.Printf("Testing gates timeouts, completed. Working gates: %d", len(gates))
+}
+
+func parseCli() {
+	flag.StringVar(&CF.IP_LIST_FILENAME, "ip_list_file", "ip_list", "Filename with ip gateways")
+	flag.IntVar(&CF.GATE_TIMEOUT, "gate_timeout", 10, "Maximum time (in seconds) to wait for response from gate")
+	flag.IntVar(&CF.MAX_RETRIES, "max_retries", 10, "Maximum number of retries for one request")
+	flag.StringVar(&CF.PORT, "port", "8080", "Listen server port")
+
+	flag.Parse()
+	
+	logger.Printf("%+v\n", &CF)
 }
 
 func main() {
 	initLogger()
+	parseCli()
 	loadIpList()
 	testGates()
+	showStatus()
 	createServer()
+}
+
+func showStatus() {
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for _ = range ticker.C {
+			logger.Printf("Active requests: %d, active gates: %d", activeRequests, len(gates))
+		}
+	}()
 }
 
 func getRandomGate() *Gate {
