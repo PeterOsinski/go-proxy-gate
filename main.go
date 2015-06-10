@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -19,6 +20,7 @@ type CLI struct {
 	GATE_TEST_TIMEOUT int
 	GATE_REQ_TIMEOUT  int
 	MAX_RETRIES       int
+	SIM_REQ           int
 	UA_LIST           string
 }
 
@@ -27,13 +29,16 @@ var CF CLI
 const TIMEOUT_TEST_URL = "http://api.ipify.org"
 
 var logger log.Logger
-var gates []Gate
+var gates []*Gate
 var uaList []string
 var activeRequests int
 
 type Gate struct {
 	address *url.URL
 	timeout []int
+	success int
+	fail    int
+	client  *http.Client
 }
 
 func loadLinesFromFile(f string) []string {
@@ -52,7 +57,7 @@ func loadLinesFromFile(f string) []string {
 func loadIpList() {
 	for _, address := range loadLinesFromFile(CF.IP_LIST_FILENAME) {
 		proxyUrl, _ := url.Parse("http://" + address)
-		gates = append(gates, Gate{address: proxyUrl})
+		gates = append(gates, &Gate{address: proxyUrl})
 	}
 }
 
@@ -63,12 +68,11 @@ type RequestWithTime struct {
 	gate     *Gate
 }
 
-func makeGetRequest(g Gate, url string, timeout int, responses chan RequestWithTime) {
-	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(g.address)},
-		Timeout:   time.Duration(time.Duration(timeout) * time.Second),
-	}
+func makeGetRequest(g *Gate, url string, responses chan RequestWithTime) {
 
+	//	logger.Printf("Fire request to %s with gate %s", url, g.address.String())
+	logger.Printf("Using gate with %d/%d success/fail ratio", g.success, g.fail)
+	
 	req, _ := http.NewRequest("GET", url, nil)
 
 	if len(uaList) > 0 {
@@ -76,11 +80,12 @@ func makeGetRequest(g Gate, url string, timeout int, responses chan RequestWithT
 	}
 
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := g.client.Do(req)
 	dur := int(time.Since(start) / 1000000)
 
-	//		logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
-	responses <- RequestWithTime{resp, dur, err, &g}
+	//	logger.Printf("Request to %s with gate %s took %d ms", url, g.address.String(), dur)
+
+	responses <- RequestWithTime{resp, dur, err, g}
 }
 
 func initLogger() {
@@ -103,33 +108,50 @@ func createServer() {
 	}
 }
 
-func handle(w http.ResponseWriter, r *http.Request, retryCount int) {
-
-	gate := getRandomGate()
-
-	response := make(chan RequestWithTime, 1)
-	makeGetRequest(*gate, r.URL.String(), CF.GATE_REQ_TIMEOUT, response)
-	resp := <-response
-
+func validateResponse(resp RequestWithTime) ([]byte, error) {
 	if resp.err == nil && resp.response.StatusCode == 200 {
 		content, errRead := ioutil.ReadAll(resp.response.Body)
 		timeout := (resp.time - 100) > (CF.GATE_REQ_TIMEOUT * 1000)
-		
+
 		if errRead != nil {
-//			logger.Println("Error while reading buffer")
+			//			logger.Println("Error while reading buffer")
 		}
-		
+
 		if timeout {
-//			logger.Println("Timeout reading body")
+			//			logger.Println("Timeout reading body")
 		}
-		
+
 		contentStr := string(content)
-		
+
 		a1 := strings.Contains(contentStr, "</html>")
 		a2 := strings.Contains(contentStr, "</body>")
-		
+
 		if a1 && a2 && errRead == nil && !timeout && len(strings.Trim(contentStr, " ")) > 0 {
-//			logger.Println("Good", len(contentStr), resp.time)
+			//			logger.Println("Good", len(contentStr), resp.time)
+
+			resp.gate.success++
+			return content, nil
+		}
+	}
+
+	resp.gate.fail++
+	return []byte{}, errors.New("invalid response")
+}
+
+func handle(w http.ResponseWriter, r *http.Request, retryCount int) {
+
+	responseSend := false
+
+	response := make(chan RequestWithTime, CF.SIM_REQ)
+
+	for i := 1; i <= CF.SIM_REQ; i++ {
+		go makeGetRequest(getRandomGate(), r.URL.String(), response)
+	}
+
+	for a := 1; a <= CF.SIM_REQ; a++ {
+		resp := <-response
+		if content, err := validateResponse(resp); !responseSend && err == nil {
+			responseSend = true
 			w.Write(content)
 			return
 		}
@@ -150,11 +172,17 @@ func testGates() {
 	logger.Printf("Testing gates timeouts, %d gates", len(gates))
 	responses := make(chan RequestWithTime, len(gates))
 
-	for _, gate := range gates {
-		go makeGetRequest(gate, TIMEOUT_TEST_URL, CF.GATE_TEST_TIMEOUT, responses)
+	for _, gate := range gates { 
+	
+		client := new(http.Client)
+		client.Transport = &http.Transport{Proxy: http.ProxyURL(gate.address)}
+		client.Timeout = time.Duration(time.Duration(CF.GATE_TEST_TIMEOUT) * time.Second)
+		gate.client = client
+
+		go makeGetRequest(gate, TIMEOUT_TEST_URL, responses)
 	}
 
-	workingGates := []Gate{}
+	workingGates := []*Gate{}
 	for a := 1; a <= len(gates); a++ {
 		resp := <-responses
 		if resp.err == nil && resp.response.StatusCode == 200 && resp.response.ContentLength >= 7 && resp.response.ContentLength <= 15 {
@@ -162,7 +190,9 @@ func testGates() {
 			if contents != nil {
 				//				logger.Printf("Took time - %dms, response: %s (%d)", resp.time, contents, resp.response.ContentLength)
 				resp.gate.timeout = append(resp.gate.timeout, resp.time)
-				workingGates = append(workingGates, *resp.gate)
+
+				resp.gate.client.Timeout = time.Duration(time.Duration(CF.GATE_REQ_TIMEOUT) * time.Second)
+				workingGates = append(workingGates, resp.gate)
 				fmt.Printf(".")
 			}
 		}
@@ -182,6 +212,7 @@ func parseCli() {
 	flag.IntVar(&CF.MAX_RETRIES, "max_retries", 10, "Maximum number of retries for one request")
 	flag.StringVar(&CF.PORT, "port", "8080", "Listen server port")
 	flag.StringVar(&CF.UA_LIST, "ua_list", "ua", "list with user-agent strings")
+	flag.IntVar(&CF.SIM_REQ, "sim_req", 1, "How many same requests should be fired to maximize the chance for response")
 
 	flag.Parse()
 
@@ -214,5 +245,5 @@ func getRandomUA() string {
 
 func getRandomGate() *Gate {
 	rand.Seed(time.Now().UnixNano())
-	return &gates[rand.Intn(len(gates))]
+	return gates[rand.Intn(len(gates))]
 }
